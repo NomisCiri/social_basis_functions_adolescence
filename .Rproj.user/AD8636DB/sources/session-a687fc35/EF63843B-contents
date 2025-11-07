@@ -1,0 +1,872 @@
+---
+title: "analyse_sod_data"
+author: "Simon"
+date: "2024-01-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(buildtools.check = function(action) TRUE)
+
+pacman::p_load(R.matlab,jsonlite,tidyverse,here,broom,broom.mixed,lme4,DEoptim, Rcpp, plyr, parallel,BH,tidyverse,bayestestR,brms,logspline,glmnet)
+
+here::i_am("./analyse_sod_data_brm.Rmd")
+
+priors_bf <- c(
+  set_prior("normal(0, 0.2)", class = "b") # Coefficients
+)
+
+
+```
+
+
+
+# Data preparation
+
+I add a flag to indicate whether we are looking at adoelscents, or adults and recode O1 and O2 to indicate relevant and irrelevant opponents, which is different in differnt trials. 
+I also summarise the decison type variable into partner and self trials. I did not z-score the performances.
+
+```{r}
+#self: 1, partner:2, group:3
+sod_data<-read_csv(here::here("data","sod_data.csv"))%>%filter(!is.na(version))%>%
+  mutate(group=ifelse(age>=18,"adults","adolescents")) %>% filter(trial>4)%>%
+  rowwise()%>%
+  mutate(self_partner=case_when(
+    (decision_type==1 | decision_type == 2)~"self", # 1 and 2 are self trials
+    (decision_type==3 | decision_type == 4)~"partner", # 2 and 3 are partner trials
+    decision_type==5 ~ "group" #. 5 are group trials
+  ))%>%
+  mutate(Or=case_when(
+    (decision_type==1 | decision_type == 3)~O1, #i.e., 'S vs. O1' or  'P vs. O1', makes O1, relevant opponent
+    (decision_type==2 | decision_type == 4)~O2, # i.e., 'P vs.O2' or 'P vs. 02' makes O2 the relevant opponent
+    decision_type==5 ~ O1# here it does not matter
+  ),
+  Oi=case_when(
+    (decision_type==1 | decision_type == 3)~O2, #i.e., 'S vs. O1' or  'P vs. O1', makes O2, irrelevant opponent
+    (decision_type==2 | decision_type == 4)~O1, # i.e., 'P vs.O2' or 'P vs. 02' makes O1 the irrelevant opponent
+    decision_type==5 ~ O2# does not matter
+  )
+  )%>%select(-S_perf,-P_perf,-O1_perf,-O2_perf)%>%
+  mutate(#make factors
+    group=factor(group),
+    self_partner=factor(self_partner)
+  )
+
+#sanity check compute bonus by hand again there should be no difference between out eng and this bonus.
+sod_data_hand_cb<-sod_data%>%rowwise()%>%mutate(
+  bonus_comp=case_when(
+    decision_type == 1 ~ S - O1 + bonus,
+    decision_type == 2 ~ S - O2 + bonus, # 1 and 2 are self trials
+    decision_type == 3 ~ P - O1 + bonus, # 2 and 3 are partner trials
+    decision_type == 4 ~ P - O2 + bonus,
+    decision_type == 5 ~ (S+P) - (O1 + O2)  + bonus#. 5 are group trials
+  )
+)%>%mutate(diff=bonus_comp-out_eng)
+
+# these are sanity checks....
+hist(sod_data_hand_cb$diff)
+hist(sod_data_hand_cb$out_eng)# should 
+
+means_medians<-sod_data%>%group_by(group)%>%#filter(rt<10000)%>%
+  dplyr::summarise(m_rt=mean(rt),
+                   med_rt=median(rt))
+
+```
+
+```{r}
+
+reg_dat<-sod_data%>%filter(self_partner!="group")%>%rowwise()%>%
+  mutate(
+    relevant=case_when(self_partner=="self" ~ (S-Or)+bonus,
+                       self_partner=="partner" ~ (P-Or)+bonus
+    ),
+    irrelevant=case_when(self_partner=="self" ~ P-Oi,
+                         self_partner=="partner" ~ S-Oi
+    )
+  )%>% mutate(
+    relevant=(relevant-mean(relevant))/sd(relevant)*0.5,
+    irrelevant=(irrelevant-mean(irrelevant))/sd(irrelevant)*0.5
+  )%>%
+  mutate(Pr=ifelse(self_partner=="self",S,P))%>%
+  mutate(Pi=ifelse(self_partner=="self",P,S))
+```
+
+
+
+# Look at individual slopes
+
+Here, i am computing a logistic regression that predicts "engage decisions", decisions in which participants said that they or their group performed better than the others.
+We include Difference scores for of self partner relevant and irrelevant other and the bonus.
+We compute separate regressions for trial types (self, partner) and each participant.
+
+I use a ridge regression for every participant, where i compute a regularization parameter, $\lambda$, for the population, which is applied to the first level regressions.
+
+```{r}
+set.seed(1234)
+
+# infer regularization parameter using cross validation
+f<-model.matrix(response_n~relevant*irrelevant,data = reg_dat,family="binomial")
+u<-reg_dat$response_n
+lambda=cv.glmnet(f, u,family="binomial")
+l_for_all=lambda$lambda.1se
+
+# function that is fitting ridge regression
+ridge_r<-function(dat,lambda){
+  dat<-dat%>%filter(self_partner!="group")
+  x<-model.matrix(response_n~relevant*irrelevant,data = dat,family="binomial")
+  y<-dat$response_n
+  mod<-glmnet(x,y,family = "binomial",lambda = lambda)
+  tidy(mod)
+}
+
+ridge_fitted_weights<-reg_dat%>%filter(self_partner!="group")%>%
+  group_by(subject_id,group,self_partner,sex,age)%>%
+  do(
+    ridge_r(dat=.,lambda=l_for_all)
+  )
+```
+
+
+```{r message=F}
+# frequentist.
+ridge_fitted_weights%>%
+  filter(term %in% c("irrelevant","relevant"))%>%
+  lm(estimate~group*term,data=.)%>%anova()
+
+# post hoc
+ridge_fitted_weights%>%
+  filter(term %in% c("irrelevant"))%>%
+  lm(estimate~group,data=.)%>%anova()
+
+# freq t test
+t.test(
+  ridge_fitted_weights%>%
+    filter(term == "irrelevant" & group == "adolescents")%>%pull(estimate),
+  ridge_fitted_weights%>%
+    filter(term == "irrelevant" & group == "adults")%>%pull(estimate)
+)
+
+# Bayesian regression
+modbrm<-ridge_fitted_weights%>%
+  filter(term %in% c("irrelevant","relevant"))%>%
+  brm(
+    estimate~group*term,
+    data=.,
+    prior = priors_bf,
+    sample_prior = T,
+    chains=4,iter=100000,seed = 1234,threads = threading(static = T),
+    file = here::here("derivatives","weights_age_interaction.rds")
+  )
+
+
+# "post hoc t-test; direct comparison"
+modbrm_group<-ridge_fitted_weights%>%
+  filter(term %in% c("irrelevant"))%>%
+  brm(
+    estimate~group,
+    data=.,
+    prior = priors_bf,
+    sample_prior = T,
+    chains=4,iter=100000,seed = 1234,threads = threading(static = T),
+    file = here::here("derivatives","irr_weights_age.rds")
+  )
+
+## Priors for Bayes factors
+modbrm_priors<-ridge_fitted_weights%>%
+  filter(term %in% c("irrelevant","relevant"))%>%
+  brm(
+    estimate~group*term,
+    data=.,
+    prior = priors_bf,
+    sample_prior = "only",
+    chains=4,iter=100000,seed = 1234,threads = threading(static = T),
+    file = here::here("derivatives","priors_weights_age_interaction.rds")
+  )
+
+modbrm_group_priors<-ridge_fitted_weights%>%
+  filter(term %in% c("irrelevant"))%>%
+  brm(
+    estimate~group,
+    data=.,
+    prior = priors_bf,
+    sample_prior = "only",
+    chains=4,iter=100000,seed = 1234,threads = threading(static = T),
+    file = here::here("derivatives","prior_irr_weights_age.rds")
+  )
+
+
+```
+
+# Compute inference statistics
+
+Here, we calculate the Bayes factor when comparing irrelevant weights between age groups.
+
+### Regression with interaction term. 
+
+```{r}
+
+BF_whole<-bayesfactor_parameters(modbrm,prior=modbrm_priors)
+posterior_whole<-describe_posterior(modbrm)
+
+posterior_whole
+BF_whole
+```
+
+### Regression t-test equivavlent for irrelvant weights.
+
+```{r}
+BF_group<-bayestestR::bayesfactor_parameters(modbrm_group,prior=modbrm_group_priors)
+posterior_group<-describe_posterior(modbrm_group)
+
+posterior_group
+BF_group
+```
+
+
+# Performance and reaction time
+
+Here we regress correct choices on prticipants age groups and whether we asked for self, partner or group decisions.
+We also regress rts 
+
+```{r}
+sod_data$self_partner=factor(sod_data$self_partner,levels=c("self","partner","group"),ordered=F)
+
+perf_mod<-sod_data%>%
+  brm(correct ~ group*self_partner,
+      data=.,
+      prior=priors_bf,
+      family=bernoulli(link='logit'),
+      cores=4,
+      file=here::here("derivatives","performance_model.rds")
+  )
+
+
+# reaction times
+rt_mod<-sod_data%>%
+  brms::brm(
+    rt~group,
+    family=shifted_lognormal(),
+    data=.,cores=4,
+    sample_prior = T,
+    prior=priors_bf,
+    file=here::here("derivatives","rt_model.rds")
+  )
+
+rt_mod_prior<-sod_data%>%
+  brms::brm(
+    rt~group,
+    family=shifted_lognormal(),
+    data=.,cores=4,
+    sample_prior = "only",
+    prior=priors_bf,
+    file_refit = "on_change",
+    file=here::here("derivatives","prior_rt_model.rds")
+  )
+
+perf_mod_prior<-sod_data%>%
+  brm(correct ~ group*self_partner,
+      data=.,
+      prior=priors_bf,
+      family=bernoulli(link='logit'),
+      sample_prior = "only",
+      cores=4,
+      file=here::here("derivatives","prior_performance_model.rds")
+  )
+
+```
+
+# Group differences in performance? 
+
+We find one.
+```{r}
+bayesfactor_parameters(perf_mod,prior=perf_mod_prior)
+describe_posterior(perf_mod)
+```
+
+# Group differences in response time?
+
+No.
+```{r}
+bayesfactor_parameters(rt_mod,prior=rt_mod_prior)
+describe_posterior(rt_mod)
+```
+
+
+# Figures
+
+
+## Percent correct and reaction time figure
+
+```{r fig.width=8,fig.height=4}
+sod_data$self_partner=factor(sod_data$self_partner,levels=c("self","partner","group"),ordered=T)
+perfs<-sod_data%>%ungroup()%>%
+  group_by(subject_id,self_partner,group)%>%
+  dplyr::summarise(correct=mean(correct))%>%
+  ggplot(aes(x=self_partner,y=correct,color=as.factor(group),group=interaction(group,self_partner)))+
+  stat_summary(position=position_dodge(0.9),fun.data = "mean_cl_boot")+
+  geom_boxplot(position = position_dodge(0.9))+
+  coord_cartesian(ylim=c(0,1))+
+  scale_x_discrete(name="Group condition")+
+  scale_color_manual(name="",breaks=c("adolescents","adults"),values=c("orange","blue"))+
+  scale_y_continuous(name="Proportion correct")+
+  theme_bw(14)+
+  theme(aspect.ratio=1,
+        legend.position = c(0.35,0.28),
+        legend.background = element_blank())
+
+rts<-sod_data%>%filter(rt<10000)%>%
+  ggplot(aes(x=rt,color=as.factor(group),group=group))+
+  geom_density(aes(fill=group),alpha=0.1)+#,position = "dodge")+
+  scale_x_continuous(name="Reaction time [ms]")+
+  scale_y_continuous(name="Density [au]",labels = scales::number_format(accuracy = 0.01))+
+  geom_vline(aes(xintercept=means_medians[means_medians$group=="adolescents",]$m_rt),color="orange",linetype="dotdash",size=1)+
+  #  geom_vline(aes(xintercept=means_medians[means_medians$group=="adolescents",]$med_rt),color="orange",linetype="dashed",size=1)+
+  geom_vline(aes(xintercept=means_medians[means_medians$group=="adults",]$m_rt),color="blue",linetype="dotdash",size=1)+
+  #geom_vline(aes(xintercept=means_medians[means_medians$group=="adults",]$med_rt),color="blue",linetype="dashed",size=1)+
+  scale_color_manual(name="",breaks=c("adolescents","adults"),values=c("orange","blue"))+
+  scale_fill_manual(name="",breaks=c("adolescents","adults"),values=c("orange","blue"))+
+  theme_bw(14)+
+  theme(aspect.ratio=1,
+        legend.position = "none",
+        legend.background = element_blank(),
+        axis.text.y = element_text(color="white"))
+
+perf_rt_plot<-cowplot::plot_grid(perfs,rts,labels="auto")
+perf_rt_plot
+ggsave(perf_rt_plot,filename="perf_plot.jpg",width=8,height=4,dpi=600)
+```
+
+
+# Age Effect of irrelevant weights on population level
+
+
+#### Figure 4a
+```{r}
+
+# This here is a ridge regression function, analogously to the above one to visualize the individual player weights,
+# For power reasons they have been summarised above.
+
+ridge_r_viz<-function(dat,lambda){
+  # print("huh")
+  dat<-dat%>%filter(self_partner!="group")
+  x<-model.matrix(response_n~S+P+Or+Oi+bonus,data = dat,family="binomial")
+  y<-dat$response_n
+  #l=cv.glmnet(x, y,family="binomial")$lambda.min
+  mod<-glmnet(x,y,family = "binomial",lambda = lambda)
+  tidy(mod)
+}
+
+
+ridge_fitted_weights_viz<-reg_dat%>%filter(self_partner!="group")%>%
+  group_by(subject_id,group,self_partner,sex,age)%>%
+  do(
+    ridge_r_viz(dat=.,lambda=l_for_all)
+  )
+
+## This makes the average bar graphs
+p_ppt_lvl_slopes<-ridge_fitted_weights_viz%>%
+  mutate(group=ifelse(age>18,"adults","adolescents"))%>%rowwise()%>%
+  filter(term %in% c("S","P","Oi","Or"))%>%
+  mutate(rel_irel=case_when(
+    self_partner=="partner" & term %in% c("S")~"Pi",
+    self_partner=="self" & term %in% c("P")~"Pi",
+    self_partner=="partner" & term %in% c("P")~"Pr",
+    self_partner=="self" & term %in% c("S")~"Pr",
+    term %in% c("Oi","Or")~term
+  ))%>%filter(!is.na(rel_irel))%>%
+  mutate(rel_irel=factor(rel_irel,levels = c("Pr","Pi","Or","Oi"),labels=c("Ir","Ii","Or","Oi")))%>%
+  ggplot(aes(x=rel_irel,y=estimate,color=group))+
+  stat_summary(position=position_dodge(1),fun.data = "mean_se",geom="bar",fill="grey")+
+  stat_summary(position=position_dodge(1),fun.data = "mean_cl_boot")+
+  scale_y_continuous(name="Decision weight")+
+  scale_x_discrete(name="Player")+
+  scale_color_manual(name="",breaks=c("adolescents","adults"),values=c("orange","blue"))+
+  geom_hline(aes(yintercept=0))+
+  guides(color=F)+
+  theme_bw(14)+
+  theme(aspect.ratio = 1)
+
+
+## The little inset figure 
+p_ppt_lvl_slopes_inset<-ridge_fitted_weights_viz%>%
+  mutate(group=ifelse(age>18,"adults","adolescents"))%>%rowwise()%>%
+  filter(term %in% c("S","P","Oi","Or"))%>%
+  mutate(rel_irel=case_when(
+    self_partner=="partner" & term %in% c("S")~"Pi",
+    self_partner=="self" & term %in% c("P")~"Pi",
+    self_partner=="partner" & term %in% c("P")~"Pr",
+    self_partner=="self" & term %in% c("S")~"Pr",
+    term %in% c("Oi","Or")~term
+  ))%>%filter(!is.na(rel_irel))%>%
+  mutate(rel_irel=factor(rel_irel,levels = c("Pr","Pi","Or","Oi"),labels=c("Ir","Ii","Or","Oi")))%>%
+  ggplot(aes(x=rel_irel,y=estimate,color=group))+#group=interaction(group,rel_irel)))+
+  geom_dotplot(binaxis = "y", stackdir = "center",dotsize=0.5,position = "dodge",binwidth=0.1)+
+  scale_y_continuous(name="Decision weight")+
+  scale_x_discrete(name="Player")+
+  scale_color_manual(name="",breaks=c("adolescents","adults"),values=c("orange","blue"))+
+  # stat_summary()+
+  geom_hline(aes(yintercept=0))+
+  guides(color=F)+
+  # facet_grid(.~ self_partner)+#,labeller = labeller(self_partner=labels))+
+  coord_cartesian(ylim=c(-3,3))+
+  theme_bw(9)+
+  theme(aspect.ratio = 1)
+
+# needed for inset
+library(grid)
+# Convert the inset plot to a grob
+inset_grob <- ggplotGrob(p_ppt_lvl_slopes_inset)
+# Add the inset to the main plot
+p_ppt_lvl_slopes_withinset <- p_ppt_lvl_slopes +
+  annotation_custom(
+    grob = inset_grob,
+    xmin = 2.5, xmax = 4.5,  # Adjust these values to position the inset
+    ymin = 0.07, ymax = 1
+  )
+
+
+```
+
+
+### Panel 4b
+```{r}
+#This regression just for visualization. A full random slopes model does not converge. We need ridge regression.
+glm(response_n ~ relevant*irrelevant*group,data=reg_dat,family = binomial(link=logit))%>%anova()
+mod_populationlevel<-glm(response_n ~ relevant*irrelevant*group,data=reg_dat,family = binomial(link=logit))
+
+ina_plots<-sjPlot::plot_model(mod_populationlevel,type="int")
+
+#complete figure will be assembled later
+pred<-ina_plots[[3]]+
+  scale_color_manual(name="",breaks=c("adolescents","adults"),values=c("orange","blue"))+
+  scale_fill_manual(name="",breaks=c("adolescents","adults"),values=c("orange","blue"))+
+  scale_x_continuous(name="Irrelevant player difference score\n(DSirr = Ii-Oi)")+
+  scale_y_continuous(name="Probability of ingroup choice")+
+  annotate("text", x = 0.1, y = 0.6, label = "*",color = "black",size=7)+theme_bw(14)+
+  theme(
+    aspect.ratio=1,
+    plot.title = element_blank(),
+    legend.position = c(0.7,0.2)
+  )
+
+```
+
+### Panel 4c
+
+```{r}
+#concatanete fits and priors
+fit_prior_tbl<-rbind(
+  modbrm_group%>%
+    tidybayes::gather_draws(b_group1)%>%select(.value)%>%mutate(fits_prior="2fits"),
+  
+  modbrm_group_priors%>%
+    tidybayes::gather_draws(b_group1)%>%select(.value)%>%mutate(fits_prior="1prior")
+)
+
+colors<-RColorBrewer::brewer.pal(n=3,name="Dark2")
+
+fit_prior_tbl %>%
+  ggplot(aes(x = .value, alpha = fits_prior)) +
+  scale_alpha_manual(name="",values=c(0.1,1),labels=c("prior","posterior"))+
+  tidybayes::stat_halfeye(normalize = "panels", interval_color = "black", point_color = "black",color="black") +
+  scale_x_continuous(name="\u03B2 agegroup adults")+
+  scale_y_continuous(name="Density")+
+  # geom_vline(aes(xintercept = 0),color=colors[2]) +
+  annotate("text", x = -Inf, y = Inf, label = "Inhibitory control model", hjust = -0.2, vjust = 2, color = colors[1]) +
+  annotate("segment", x = -0.2, xend = -1,y = 1, yend = 1, 
+           arrow = arrow(type = "closed", length = unit(0.1, "inches")),
+           color = colors[1])+
+  annotate("text", x = 0, y = Inf, label = "Temperature model", hjust=1.05,vjust=-0.15, color = colors[2],angle=90)+
+  annotate("segment", x = 0, xend = 0,y = 1.2, yend = -0.1, 
+           arrow = arrow(type = "closed", length = unit(0.1, "inches")),
+           color = colors[2])+
+  annotate("text", x = Inf, y = Inf, label = "Basis function model", hjust = 1.2, vjust = 2, color = colors[3])+
+  annotate("segment", x = 0.2, xend = 1, y = 1, yend = 1, 
+           arrow = arrow(type = "closed", length = unit(0.1, "inches")),
+           color = colors[3])+
+  theme_bw(14)+
+  theme(aspect.ratio=0.3,
+        legend.position = c(0.84,0.8),
+        legend.background = element_blank())->hypothesis_test_plot
+
+
+# This plot here is for a presentation that shows the prior only.
+fit_prior_tbl %>% filter(fits_prior=="1prior")%>%
+  ggplot(aes(x = .value, alpha = fits_prior)) +
+  scale_alpha_manual(name="",values=c(0.1,1),labels=c("prior","posterior"))+
+  tidybayes::stat_halfeye(normalize = "panels", interval_color = "black", point_color = "black",color="black") +
+  scale_x_continuous(name=expression(beta*" agegroup "[adults]))+
+  scale_y_continuous(name="Density")+
+  geom_vline(aes(xintercept = 0),color=colors[2]) +
+  annotate("text", x = -Inf, y = Inf, label = "Inhibitory control model", hjust = -0.2, vjust = 2, color = colors[1]) +
+  annotate("segment", x = -0.2, xend = -1,y = 0.9, yend = 0.9, 
+           arrow = arrow(type = "closed", length = unit(0.2, "inches")),
+           color = colors[1])+
+  annotate("text", x = 0, y = Inf, label = "Temperature model", hjust=1.2,vjust=-0.2, color = colors[2],angle=90)+
+  annotate("text", x = Inf, y = Inf, label = "Basis function model", hjust = 1.2, vjust = 2, color = colors[3])+
+  annotate("segment", x = 0.2, xend = 1, y = 0.9, yend = 0.9, 
+           arrow = arrow(type = "closed", length = unit(0.2, "inches")),
+           color = colors[3])+
+  theme_bw(14)+
+  theme(aspect.ratio=0.3,
+        legend.position = c(0.84,0.7))->hypothesis_test_plot_priors
+
+```
+
+
+```{r, fig.height=9,fig.width=7}
+#adding figures together
+behav_plots<-cowplot::plot_grid(p_ppt_lvl_slopes_withinset,pred,rel_widths = c(1,1),labels=c("a","b"))
+alltogether<-cowplot::plot_grid(behav_plots,hypothesis_test_plot+theme(legend.position = c(0.8,0.6)),nrow=2,labels=c("","c"))#,rel_heights = c(1,0.6))
+alltogether
+ggsave(alltogether,filename=here::here("figures","behav_slopes_model.jpeg"),width = 9,height = 7,dpi=600)
+
+#hypothesis_test_plot+theme(legend.position = c(0.8,0.6))
+alltogether_prior_only_for_presentation<-cowplot::plot_grid(behav_plots,hypothesis_test_plot_priors+theme(legend.position = c(0.8,0.6)),nrow=2,labels=c("","c"))#,rel_heights = c(1,0.6))
+alltogether_prior_only_for_presentation
+ggsave(alltogether_prior_only_for_presentation,filename=here::here("figures","behav_slopes_model_present.jpeg"),width = 9,height = 7.5)
+
+```
+
+
+# DDM
+Here we can check whether there are separate drift rates for irrelevant others and basis functions.
+Note, the model is fitted with two different scripts; for self and partner trials; because the Basis functions differ.
+
+```{r}
+# first i need to deal with the wierd output
+partner_fits<-read_csv(file = here::here("tddm","fits","fits_tDDM_partner.csv"))
+partner_fits<-partner_fits[2:length(partner_fits)]# trim first entry because its a row number
+
+idx_partner<-seq(1,length(partner_fits),by=11)# get indicies of individual participants, each ppt has 11 entries
+partner_df<-NULL# container
+
+for (i in idx_partner){
+  row<-partner_fits[i:(i+10)]# every 11 entries a new participant starts
+  names(row)<-c("d_1bf", "d_2bf", "d_bonus", "thres", "nDT", "time_2bf", "bias", "LL", "BIC", "AIC","ppt")
+  partner_df<-rbind(row,partner_df)# concat
+}
+
+self_fits<-read_csv(file = here::here("tddm","fits","fits_tDDM_self.csv"))
+self_fits<-self_fits[2:length(self_fits)]# trim first entry because its a row number
+idx_self<-seq(1,length(self_fits),by=11)# get indicies of individual participants, each ppt has 11 entries
+self_ddm_df<-NULL
+
+for (i in idx_self){
+  row<-self_fits[i:(i+10)]# every 11 entries a new participant starts
+  names(row)<-c("d_1bf", "d_2bf", "d_bonus", "thres", "nDT", "time_2bf", "bias", "LL", "BIC", "AIC","ppt")
+  self_ddm_df<-rbind(row,self_ddm_df)
+}
+
+```
+
+```{r}
+# combine ddm data with other data frame
+sod_data_partner_ddf<-left_join(sod_data%>%filter(self_partner=="self")%>%mutate(ppt=subject_id),self_ddm_df,by="ppt")
+sod_data_self_ddf<-left_join(sod_data%>%filter(self_partner=="partner")%>%mutate(ppt=subject_id),partner_df,by="ppt")
+sod_self_partner<-rbind(sod_data_partner_ddf,sod_data_self_ddf)
+parameters<-c( "d_1bf","d_2bf","d_bonus", "time_2bf","bias","thres","nDT")#colnames(sod_self_partner)[29:35]
+
+# make 
+labs<-c(expression(lambda*"_firstBF"),expression(lambda*"_secondBF"),expression(lambda*"_bonus"),expression(theta),expression("bias"),expression(zeta),expression(nDT))
+
+
+d_plots<-sod_self_partner%>%select(parameters,subject_id,self_partner,group)%>%unique()%>%
+  pivot_longer(parameters)%>%group_split(name)%>%
+  imap(.,~{
+    label_idx=which(parameters==.x$name)
+    ggplot(data=.x,aes(y=value,x=group,color=group))+
+      stat_boxplot(aes(color=group),fill=NA)+
+      stat_summary()+
+      scale_fill_manual(name="",labels=c("adolescents","adults"),values=c("orange","blue"))+
+      scale_color_manual(name="",labels=c("adolescents","adults"),values=c("orange","blue"))+
+      scale_x_discrete(name="")+
+      ggtitle(labs[label_idx])+
+      guides(color=F,fill=F,linetype=F)+
+      theme_bw(14)+theme(aspect.ratio=1,#axis.text.y=element_blank(),
+                         axis.text.x = element_blank())}
+  )
+
+# save parameter density plots in list
+w_guides<-sod_self_partner%>%select(parameters,subject_id,self_partner,group)%>%unique()%>%
+  pivot_longer(parameters)%>%group_split(name)%>%
+  map(.,~{ggplot(data=.x,aes(x=value,color=group))+
+      geom_density(aes(color=group),fill=NA)+
+      scale_fill_manual(name="",labels=c("adolescents","adults"),values=c("orange","blue"))+
+      scale_color_manual(name="",labels=c("adolescents","adults"),values=c("orange","blue"))+
+      scale_x_discrete(name="")+
+      scale_linetype_discrete(name="")+
+      ggtitle(unique(.x$name))+
+      # guides(color=F,fill=F,linetype=F)+
+      theme_bw(14)+theme(aspect.ratio=1,axis.text.y=element_blank(),
+                         axis.text.x = element_blank())}
+  )
+
+
+```
+
+# Compute group differences stats
+
+All of these analysis also check if it makes a difference whether there are self or partner trails.
+This is noowhere the case.
+
+```{r}
+# first, subset so that there are no duplicate values.
+dat<-sod_self_partner%>%select(parameters,subject_id,self_partner,group)%>%unique()
+
+d_prim_basis<-brm(
+  d_1bf~group*self_partner,
+  data=dat,
+  ,chains=8,iter=100000,cores = 8,prior=priors_bf,sample_prior = T,
+  file = "primary.rds",file_refit = "always"
+)
+
+
+d_sec_basis<-brm(
+  d_2bf ~group*self_partner,
+  data=dat,
+  ,chains=8,iter=100000,cores = 8,prior=priors_bf,sample_prior = T,
+  file = "secondary.rds",file_refit = "always"
+)     
+
+d_bonus_basis<-brm(
+  d_bonus ~group*self_partner,
+  data=dat,
+  chains=8,iter=100000,cores = 8,prior=priors_bf,sample_prior = T ,
+  file = "bonus.rds",file_refit = "always"
+)   
+
+d_tresh<-brm(
+  thres   ~group*self_partner,data=dat,
+  chains=8,iter=100000,cores = 8,prior=priors_bf, sample_prior = T,
+  file = "treshold.rds",file_refit = "always"
+) 
+d_nDT<-brm(
+  nDT~group*self_partner,
+  data=dat,
+  chains=8,iter=100000,cores = 8,prior=priors_bf,sample_prior = T,
+  file = "ndt.rds",file_refit = "always"
+)
+d_t_sec_Bf<-brm(
+  time_2bf~group*self_partner,
+  data=dat,
+  chains=8,iter=100000,cores = 8,prior=priors_bf,sample_prior = T,
+  file = "t_sec.rds",file_refit = "always"
+)
+bias<-brm(
+  bias ~group*self_partner,
+  data=dat,
+  chains=8,iter=100000,cores = 8,prior=priors_bf,sample_prior = T,
+  file = "bias.rds",file_refit = "always"
+)
+
+##################################
+# THIS PRIOR is the same for all #
+##################################
+
+priors<-brm(
+  bias ~group*self_partner,
+  data=dat,
+  chains=8,iter=100000,cores = 8,prior=priors_bf,sample_prior = "only",
+  file = "ddm_priors.rds",file_refit = "always"
+)
+
+recompute_bayesfactors=T
+
+```
+
+```{r}
+describe_posterior(d_prim_basis)
+describe_posterior(d_sec_basis)
+describe_posterior(d_t_sec_Bf)
+# because of the quite flat intercept prior, bayes factors can be super low for the intercept if there
+# is even a tiny probability mass over 0 in the posterior. so we also do a freq ttest against 0.
+
+t.test(dat$time_2bf)
+
+
+if(recompute_bayesfactors){
+  bf_dprim<-bayesfactor_parameters(d_prim_basis,prior=priors)
+  bf_dsec<-bayesfactor_parameters(d_sec_basis,prior=priors)
+  bf_dbonus<-bayesfactor_parameters(d_bonus_basis,prior=priors)
+  bf_dthresh<-bayesfactor_parameters(d_tresh)
+  bf_dnDT<- bayesfactor_parameters(d_nDT,prior=priors)
+  bf_dt_sec_Bf<-bayesfactor_parameters(d_t_sec_Bf,prior=priors)
+  bf_d_bias<-bayesfactor_parameters(bias,prior=priors)
+  
+  saveRDS(bf_dprim,here::here("derivatives","bf_dprim.rds"))
+  saveRDS(bf_dsec,here::here("derivatives","bf_dsec.rds"))
+  saveRDS(bf_dbonus,here::here("derivatives","bf_dbonus.rds"))
+  saveRDS(bf_dthresh,here::here("derivatives","bf_dthresh.rds"))
+  saveRDS(bf_dnDT,here::here("derivatives","bf_dnDT.rds"))
+  saveRDS(bf_dt_sec_Bf,here::here("derivatives","bf_dt_sec_Bf.rds"))
+  saveRDS(bf_d_bias,here::here("derivatives","bf_d_bias.rds"))
+}else{
+  bf_dprim<-readRDS(here::here("derivatives","bf_dprim.rds"))
+  bf_dsec<-readRDS(here::here("derivatives","bf_dsec.rds"))
+  bf_dbonus<-readRDS(here::here("derivatives","bf_dbonus.rds"))
+  bf_dthresh<-readRDS(here::here("derivatives","bf_dthresh.rds"))
+  bf_dnDT<-readRDS(here::here("derivatives","bf_dnDT.rds"))
+  bf_dt_sec_Bf<-readRDS(here::here("derivatives","bf_dt_sec_Bf.rds"))
+  bf_d_bias<-readRDS(here::here("derivatives","bf_d_bias.rds"))
+}
+
+# 
+Bfs<-tibble(
+  value=c(bf_dprim$log_BF[2],
+          bf_dsec$log_BF[2],
+          bf_dbonus$log_BF[2],
+          bf_dthresh$log_BF[2],
+          bf_dnDT$log_BF[2],
+          bf_dt_sec_Bf$log_BF[2],
+          bf_d_bias$log_BF[2]
+  ),
+  parameter=parameters
+)
+
+```
+
+```{r fig.width=10,fig.height==10}
+x_breaks<-c( "d_1bf","d_2bf","d_bonus", "time_2bf","bias","thres","nDT")
+Bfs$parameter<-factor(Bfs$parameter,levels=x_breaks)
+labs <- c(
+  "\u03BB first",   # λ  first
+  "\u03BB second",  # λ  second
+  "\u03BB bonus",   # λ  bonus
+  "\u03B8",        # θ 
+  "bias",
+  "thr",
+  "nDT"
+)#labs<-c( "d_1bf","d_2bf","d_bon", "t_2bf","bias","thr","nDT")
+
+bf_plot<-Bfs%>%
+  mutate(credible=case_when(value>=log(3)~"Age difference",
+                            value<=log(1/3)~"No age difference",
+                            T~"Undecided")
+  )%>%
+  ggplot(aes(y=value,x=parameter,fill=credible))+
+  scale_y_continuous(name=expression("Bayes factor "["10"]))+
+  scale_x_discrete(name="Parameter",breaks=x_breaks,labels=labs)+
+  scale_y_continuous(name="log of Bayes factor")+
+  scale_fill_manual(name="",values=c("#003f5c","#ef5675","#ffa600"))+
+  geom_bar(stat="identity",color="white",width=0.7)+
+  stat_identity(geom="text", aes(x=parameter,y=value, label=round(value,2)), vjust=-0.5)+
+  geom_hline(aes(yintercept=log(3)),linetype="dotted")+
+  geom_hline(aes(yintercept=log(1/3)),linetype="dotted")+
+  geom_hline(aes(yintercept=log(1)))+
+  theme_bw(14)+
+  coord_cartesian(ylim=c(-3,3))+
+  theme(#legend.background = element_rect(colour = "black"),
+    legend.position = c(0.85,0.8),
+    legend.title=element_blank(),
+    legend.background     = element_rect(fill = "transparent", colour = NA),
+    legend.box.background = element_rect(fill = "transparent", colour = NA),
+    legend.key            = element_rect(fill = "transparent", colour = NA)
+  )
+
+ggsave(bf_plot,filename=here::here("figures","bf_figures.png"),width = 7,height = 7)
+```
+
+
+
+```{r fig.width=8,fig.height=10}
+
+driftrate_bf1<-sod_self_partner%>%select(parameters,subject_id,self_partner,group)%>%unique()%>%
+  pivot_longer(parameters)%>%filter(name == "d_1bf")%>%
+  ggplot(aes(x=group,y=value,color=group))+
+  stat_boxplot(position=position_dodge(1))+
+  geom_point(alpha=0.5)+
+  stat_summary(aes(x=as.numeric(group)+0.1),fun.data="mean_cl_boot")+
+  scale_y_continuous(name="\u03BB first basis function") +
+  scale_x_discrete(name="Agegroup")+
+  scale_color_manual(values=c("orange","blue"))+
+  theme_bw(14)+
+  ggsignif::geom_signif(comparisons = list(c("adolescents", "adults")), 
+                        map_signif_level = T,
+                        annotation = c("**"),
+                        vjust = 0.6,
+                        # na.rm = T,
+                        color="black")+
+  # theme(aspect.ratio=3)+
+  guides(color="none")
+
+
+driftrate_bf12<-sod_self_partner%>%select(parameters,subject_id,self_partner,group)%>%unique()%>%
+  pivot_longer(parameters)%>%filter(name %in% c("d_1bf","d_2bf"))%>%
+  ggplot(aes(x=name,y=value,color=group))+
+  geom_point(alpha=0.5,position=position_dodge(0.1))+
+  stat_summary(position=position_dodge(0.5),fun.data = "mean_cl_boot")+
+  #stat_summary(aes(x=as.numeric(group)+0.1),fun.data="mean_cl_boot")+
+  #scale_y_continuous(name=expression(lambda*" prior")) +
+  geom_hline(yintercept=0,linetype="dotdash")+
+  scale_y_continuous(name="")+
+  scale_x_discrete(name="",labels=labs[c(1,2)])+
+  scale_color_manual(name="",values=c("orange","blue"))+
+  theme_bw(14)+
+  annotate("text", x = 1, y = 1.4, label = "**",color = "black",size=5)+
+  theme(legend.position = c(0.6,0.2),
+        legend.background     = element_rect(fill = "transparent", colour = NA),
+        legend.box.background = element_rect(fill = "transparent", colour = NA),
+        legend.key            = element_rect(fill = "transparent", colour = NA)
+  )
+# theme(aspect.ratio=3)+
+#theme(legend.position = "none")
+#library(ggsignif)
+
+
+theta<-sod_self_partner%>%select(parameters,subject_id,self_partner,group)%>%unique()%>%
+  pivot_longer(parameters)%>%filter(name %in% c("time_2bf"))%>%
+  ggplot(aes(x=name,y=value,color=group))+
+  geom_point(alpha=0.5,position=position_dodge(0.1))+
+  stat_summary(position=position_dodge(0.5),fun.data = "mean_cl_boot")+
+  #stat_summary(aes(x=as.numeric(group)+0.1),fun.data="mean_cl_boot")+
+  #scale_y_continuous(name=expression(lambda*" prior")) +
+  geom_hline(yintercept=0,linetype="dotdash")+
+  scale_x_discrete(name="",labels=labs[4])+
+  scale_y_continuous(name="")+
+  scale_color_manual(values=c("orange","blue"))+
+  theme_bw(14)+
+  #annotate("text", x = 1, y = 1.4, label = "**",color = "black",size=7)+
+  theme(legend.position = "none")
+# theme(aspect.ratio=3)+
+
+```
+
+
+```{r fig.width=13,fig.height=8}
+# run sim tDDM before to make this work
+#1B9E77
+plots<-cowplot::plot_grid(driftrate_bf1,bf_plot,nrow=1,rel_widths = c(0.3,1),labels=c("b","c","d"),hjust=0.1)
+
+
+complete_ddm_fig<-cowplot::plot_grid(ddm_fig,plots,nrow=2,labels=c("a",""))
+
+complete_ddm_fig
+```
+
+```{r}
+ggsave(complete_ddm_fig,filename = here::here("figures","ddm_figure.jpeg"),width = 13,height = 8,dpi=600)
+```
+
+
+# Compare to time varying to vanilla ddm
+
+```{r}
+# are the vanilla fits really on self?
+vanilla_fits<-read_csv(file = here::here("..","..","fits_vanilla_DDM_self.csv"))
+vanilla_fits<-vanilla_fits[2:length(vanilla_fits)]# trim first entry because its a row number
+
+idx_vanilla<-seq(1,length(vanilla_fits),by=8)# get indicies of individual participants, each ppt has 11 entries
+vanilla_df<-NULL# container
+
+for (i in idx_vanilla){
+  row<-vanilla_fits[i:(i+6)]# every 11 entries a new participant starts
+  names(row)<-c("d_1bf", "thres", "nDT", "bias", "LL", "BIC", "AIC","ppt")
+  vanilla_df<-rbind(row,vanilla_df)# concat
+}
+
+t.test(self_fits$BIC,vanilla_fits$BIC,paired = T)#%>%median()
+
+BayesFactor::ttestBF(self_fits$BIC,vanilla_fits$BIC,paired = T)
+```
