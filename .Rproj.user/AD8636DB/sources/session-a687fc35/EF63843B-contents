@@ -618,47 +618,47 @@ dat<-sod_self_partner%>%select(parameters,subject_id,self_partner,group)%>%uniqu
 d_prim_basis<-brm(
   d_1bf~group*self_partner,
   data=dat,
-  ,chains=8,iter=100000,cores = 8,prior=priors_bf,sample_prior = T,
-  file = "primary.rds",file_refit = "always"
+  prior=priors_bf,sample_prior = T,seed=1234,
+  file = here::here("derivatives","primary.rds"),file_refit = "always"
 )
 
 
 d_sec_basis<-brm(
   d_2bf ~group*self_partner,
   data=dat,
-  ,chains=8,iter=100000,cores = 8,prior=priors_bf,sample_prior = T,
-  file = "secondary.rds",file_refit = "always"
+  prior=priors_bf,sample_prior = T,seed=1234,
+  file = here::here("derivatives","secondary.rds"),file_refit = "always"
 )     
 
 d_bonus_basis<-brm(
   d_bonus ~group*self_partner,
   data=dat,
-  chains=8,iter=100000,cores = 8,prior=priors_bf,sample_prior = T ,
-  file = "bonus.rds",file_refit = "always"
+  prior=priors_bf,sample_prior = T,seed=1234,
+  file = here::here("derivatives","bonus.rds"),file_refit = "always"
 )   
 
 d_tresh<-brm(
   thres   ~group*self_partner,data=dat,
-  chains=8,iter=100000,cores = 8,prior=priors_bf, sample_prior = T,
-  file = "treshold.rds",file_refit = "always"
+  prior=priors_bf, sample_prior = T,seed=1234,
+  file = here::here("derivatives","treshold.rds"),file_refit = "always"
 ) 
 d_nDT<-brm(
   nDT~group*self_partner,
   data=dat,
-  chains=8,iter=100000,cores = 8,prior=priors_bf,sample_prior = T,
-  file = "ndt.rds",file_refit = "always"
+  prior=priors_bf,sample_prior = T,seed=1234,
+  file = here::here("derivatives","ndt.rds"),file_refit = "always"
 )
 d_t_sec_Bf<-brm(
   time_2bf~group*self_partner,
   data=dat,
-  chains=8,iter=100000,cores = 8,prior=priors_bf,sample_prior = T,
-  file = "t_sec.rds",file_refit = "always"
+  prior=priors_bf,sample_prior = T,seed=1234,
+  file = here::here("derivatives","t_sec.rds"),file_refit = "always"
 )
 bias<-brm(
   bias ~group*self_partner,
   data=dat,
-  chains=8,iter=100000,cores = 8,prior=priors_bf,sample_prior = T,
-  file = "bias.rds",file_refit = "always"
+  prior=priors_bf,sample_prior = T,seed=1234,
+  file = here::here("derivatives","bias.rds"),file_refit = "always"
 )
 
 ##################################
@@ -668,8 +668,8 @@ bias<-brm(
 priors<-brm(
   bias ~group*self_partner,
   data=dat,
-  chains=8,iter=100000,cores = 8,prior=priors_bf,sample_prior = "only",
-  file = "ddm_priors.rds",file_refit = "always"
+  prior=priors_bf,sample_prior = "only",seed=1234,
+  file = here::here("derivatives","ddm_priors.rds"),file_refit = "always"
 )
 
 recompute_bayesfactors=T
