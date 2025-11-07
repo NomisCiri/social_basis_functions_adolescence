@@ -1,4 +1,0 @@
-"0","x_breaks<-c( ""d_1bf"",""d_2bf"",""d_bonus"", ""time_2bf"",""bias"",""thres"",""nDT"")"
-"0","Bfs$parameter<-factor(Bfs$parameter,levels=x_breaks)"
-"2","Error: object 'Bfs' not found
-"
