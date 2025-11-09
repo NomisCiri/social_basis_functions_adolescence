@@ -13,16 +13,16 @@ have = want %in% rownames(installed.packages())
 if ( any(!have) ) { install.packages( want[!have] ) }
 # Now load them all
 lapply(want, require, character.only = TRUE)
-here::i_am("./tddm/tDDM_partnercondition.R")
+here::i_am("./ddm/tDDM_partnercondition.R")
 
 RcppParallel::setThreadOptions(numThreads = 1) #this is critical for running on Mac OS.
 
 ### --- how to run the tDDM:
 # load the c++ file containing the functions to simulate the time-varying DDM
-sourceCpp("tDDM_Rcpp.cpp")
+sourceCpp(here::here("ddm","ddm_models_c++","tDDM_Rcpp.cpp"))
 
 # read in behavioral data 
-dataBeh=read_csv(here::here("data","results","sod_data.csv"))%>%filter(!is.na(version))%>%
+dataBeh=read_csv(here::here("data","sod_data.csv"))%>%filter(!is.na(version))%>%
 mutate(group=ifelse(age>18,"adults","adolescents"))%>%rowwise()%>%
   mutate(self_partner=case_when(
     (decision_type==1 | decision_type == 2)~1, # 1 and 2 are self trials
@@ -150,12 +150,12 @@ fits = mclapply(inputs, fitSub, mc.cores = 1, dataBeh=dataBeh)
 
 #save now in case unlist fails
 fitsF=fits
-write.csv(fitsF, file = "fits_tDDM_partner.csv")
+write.csv(fitsF, file = here::here("ddm","fits","fits_tDDM_partner.csv"))
 
 fits = as.data.frame(matrix(unlist(fits),ncol=11,byrow=TRUE))
 names(fits)<-c("d_primBF", "d_secBF", "d_bonus", "thres", "nDT", "timesecBFIn", "bias", "LL", "BIC", "AIC","ppt")
 #will overwrite previous save, but that is intended
 fitsF=fits
-write.csv(fitsF, file = "fits_tDDM_partner.csv")
-
+write.csv(fitsF, file = here::here("ddm","fits","fits_tDDM_partner.csv"))
+          
 

@@ -156,7 +156,8 @@ modbrm<-ridge_fitted_weights%>%
     prior = priors_bf,
     sample_prior = T,
     chains=4,iter=100000,seed = 1234,threads = threading(static = T),
-    file = here::here("derivatives","weights_age_interaction.rds")
+    file = here::here("derivatives","weights_age_interaction.rds"),
+    file_refit = "always"
   )
 
 
@@ -169,7 +170,8 @@ modbrm_group<-ridge_fitted_weights%>%
     prior = priors_bf,
     sample_prior = T,
     chains=4,iter=100000,seed = 1234,threads = threading(static = T),
-    file = here::here("derivatives","irr_weights_age.rds")
+    file = here::here("derivatives","irr_weights_age.rds"),
+    file_refit = "always"
   )
 
 ## Priors for Bayes factors
@@ -181,7 +183,8 @@ modbrm_priors<-ridge_fitted_weights%>%
     prior = priors_bf,
     sample_prior = "only",
     chains=4,iter=100000,seed = 1234,threads = threading(static = T),
-    file = here::here("derivatives","priors_weights_age_interaction.rds")
+    file = here::here("derivatives","priors_weights_age_interaction.rds"),
+    file_refit = "always"
   )
 
 modbrm_group_priors<-ridge_fitted_weights%>%
@@ -192,7 +195,8 @@ modbrm_group_priors<-ridge_fitted_weights%>%
     prior = priors_bf,
     sample_prior = "only",
     chains=4,iter=100000,seed = 1234,threads = threading(static = T),
-    file = here::here("derivatives","prior_irr_weights_age.rds")
+    file = here::here("derivatives","prior_irr_weights_age.rds"),
+    file_refit = "always"
   )
 
 
@@ -458,10 +462,10 @@ pred<-ina_plots[[3]]+
 #concatanete fits and priors
 fit_prior_tbl<-rbind(
   modbrm_group%>%
-    tidybayes::gather_draws(b_group1)%>%select(.value)%>%mutate(fits_prior="2fits"),
+    tidybayes::gather_draws(b_groupadults)%>%select(.value)%>%mutate(fits_prior="2fits"),
   
   modbrm_group_priors%>%
-    tidybayes::gather_draws(b_group1)%>%select(.value)%>%mutate(fits_prior="1prior")
+    tidybayes::gather_draws(b_groupadults)%>%select(.value)%>%mutate(fits_prior="1prior")
 )
 
 colors<-RColorBrewer::brewer.pal(n=3,name="Dark2")
@@ -606,7 +610,7 @@ w_guides<-sod_self_partner%>%select(parameters,subject_id,self_partner,group)%>%
 
 ```
 
-# Compute group differences stats
+# Compute group differences stats for ddm parameters
 
 All of these analysis also check if it makes a difference whether there are self or partner trails.
 This is noowhere the case.
@@ -869,4 +873,7 @@ for (i in idx_vanilla){
 t.test(self_fits$BIC,vanilla_fits$BIC,paired = T)#%>%median()
 
 BayesFactor::ttestBF(self_fits$BIC,vanilla_fits$BIC,paired = T)
+```
+
+```{r}
 ```

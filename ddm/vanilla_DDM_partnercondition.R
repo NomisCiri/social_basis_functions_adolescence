@@ -6,7 +6,7 @@ rm(list=ls())
 # set current wd and seed
 #setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
 set.seed(007)
-here::i_am("./Analyses/R/tddm/vanilla_DDM_selfcondition.R")
+here::i_am("./ddm/vanilla_DDM_selfcondition.R")
 # Install required packages if necessary:
 want = c("DEoptim", "Rcpp", "plyr", "parallel", "BH", "tidyverse")
 have = want %in% rownames(installed.packages())
@@ -18,10 +18,10 @@ RcppParallel::setThreadOptions(numThreads = 1) #this is critical for running on 
 
 ### --- how to run the tDDM:
 # load the c++ file containing the functions to simulate the time-varying DDM
-sourceCpp(here::here("Analyses","R","tddm","vanilla_ddm_Rcpp.cpp"))
+sourceCpp(here::here("ddm","ddm_models_c++","vanilla_ddm_Rcpp.cpp"))
 
 # read in behavioral data
-dataBeh=read_csv(here::here("Analyses","R","data","results","sod_data.csv"))%>%filter(!is.na(version))%>%
+dataBeh=read_csv(here::here("data","sod_data.csv"))%>%filter(!is.na(version))%>%
   mutate(group=ifelse(age>18,"adults","adolescents"))%>%rowwise()%>%
   mutate(self_partner=case_when(
     (decision_type==1 | decision_type == 2)~1, # 1 and 2 are self trials
@@ -127,10 +127,10 @@ fits = mclapply(inputs, fitSub, mc.cores = 1, dataBeh=dataBeh)
 
 #save now in case unlist fails
 fitsF=fits
-write.csv(fitsF, file = "fits_vanilla_DDM_partner.csv")
+write.csv(fitsF, file = here::here("ddm","fits","fits_vanilla_DDM_partner.csv"))
 
 fits = as.data.frame(matrix(unlist(fits),ncol=8,byrow=TRUE))
 names(fits)<-c("d_rel","thres", "nDT", "bias", "LL", "BIC", "AIC","ppt")
 #will overwrite previous save, but that is intended
 fitsF=fits
-write.csv(fitsF, file = "fits_vanilla_DDM_partner.csv")
+write.csv(fitsF, file = here::here("ddm","fits","fits_vanilla_DDM_partner.csv"))

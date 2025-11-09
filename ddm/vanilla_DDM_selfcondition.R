@@ -6,22 +6,22 @@ rm(list=ls())
 # set current wd and seed
 #setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
 set.seed(007)
-
+here::i_am("./ddm/vanilla_DDM_selfcondition.R")
 # Install required packages if necessary:
 want = c("DEoptim", "Rcpp", "plyr", "parallel", "BH", "tidyverse")
 have = want %in% rownames(installed.packages())
 if ( any(!have) ) { install.packages( want[!have] ) }
 # Now load them all
 lapply(want, require, character.only = TRUE)
-here::i_am("./tddm/tDDM_selfcondition.R")
 
 RcppParallel::setThreadOptions(numThreads = 1) #this is critical for running on Mac OS.
+
 ### --- how to run the tDDM:
 # load the c++ file containing the functions to simulate the time-varying DDM
-sourceCpp("tDDM_Rcpp.cpp")
+sourceCpp(here::here("ddm","ddm_models_c++","vanilla_ddm_Rcpp.cpp"))
 
 # read in behavioral data
-dataBeh=read_csv(here::here("data","results","sod_data.csv"))%>%filter(!is.na(version))%>%
+dataBeh=read_csv(here::here("data","sod_data.csv"))%>%filter(!is.na(version))%>%
   mutate(group=ifelse(age>18,"adults","adolescents"))%>%rowwise()%>%
   mutate(self_partner=case_when(
     (decision_type==1 | decision_type == 2)~1, # 1 and 2 are self trials
@@ -40,8 +40,8 @@ dataBeh=read_csv(here::here("data","results","sod_data.csv"))%>%filter(!is.na(ve
   )
   )%>%#select(-S_perf,-P_perf,-O1_perf,-O2_perf)%>%
   mutate(
-    relevant=case_when(self_partner==1 ~ (S-Or),#+bonus,
-                       self_partner==2 ~ (P-Or)#+bonus
+    relevant=case_when(self_partner==1 ~ (S-Or)+bonus,
+                       self_partner==2 ~ (P-Or)+bonus
     ),
     irrelevant=case_when(self_partner==1 ~ P-Oi,
                          self_partner==2 ~ S-Oi
@@ -50,12 +50,6 @@ dataBeh=read_csv(here::here("data","results","sod_data.csv"))%>%filter(!is.na(ve
 
 #filter for self condition
 dataBeh <- filter(dataBeh, self_partner == 1)
-
-#create primary basis functions
-dataBeh$primBF <- 0.5*dataBeh$S + 0.5*dataBeh$P - 0.5*dataBeh$O1 - 0.5*dataBeh$O2#dataBeh$relevant#0.5*dataBeh$S + 0.5*dataBeh$P - 0.5*dataBeh$O1 - 0.5*dataBeh$O2
-
-#create secondary basis functions
-dataBeh$secBF <- 0.5*dataBeh$S - 0.5*dataBeh$P - 0.5*dataBeh$Or + 0.5*dataBeh$Oi#dataBeh$irrelevant#0.5*dataBeh$S - 0.5*dataBeh$P - 0.5*dataBeh$Or + 0.5*dataBeh$Oi
 
 #log-transform reaction times
 dataBeh$logRT = log(dataBeh$rt)
@@ -66,7 +60,6 @@ dataBeh$RTddm[dataBeh$response_n == 0] = dataBeh$RTddm[dataBeh$response_n == 0] 
 
 #get number of trials
 ntrials = length(dataBeh$rt)
-
 
 
 # bin the prob. density space of RTs:
@@ -82,22 +75,19 @@ for (i in 1:ntrials) {
 }
 
 ## define fitting functions ---- 
-ll_ddm2 <- function(x, dataBeh2, vd, hd, bd) {
+ll_vanilla_ddm2 <- function(x, dataBeh2, vd) {
   
   d_v = x[1] # weight for primBF
-  d_h = x[2] # weight for secBF
-  d_b = x[3] # weight for the bonus
-  thres = x[4] # threshold
-  nDT = x[5] # non-decision time
-  tHin = x[6] # relative starting time of secBF vs. primBF
-  bias = x[7] # starting point bias
+  thres = x[2] # threshold
+  nDT = x[3] # non-decision time
+  bias = x[4] # starting point bias
   
   probs = NULL
   for (i in 1:length(vd)) {
-    rts = ddm2_parallel(d_v,d_h,d_b,thres,nDT,tHin,bias,vd[i],hd[i],bd[i],3000) # simulates rts
+    rts = vanilla_ddm2_parallel(d_v,thres,nDT,bias,vd[i],3000) # simulates rts
     rts = rts[rts!=0] #remove all rts that are 0
     xdens = density(rts, from=-5, to=5, n=1024, bw=0.11)
-    idx = which(dataBeh2$primBF==vd[i] & dataBeh2$secBF==hd[i] & dataBeh2$bonus==bd[i]) 
+    idx = which(dataBeh2$relevant==vd[i]) 
     probs = c(probs, dt*xdens$y[dataBeh2$RTddm_pos[idx]])
   }
   
@@ -107,26 +97,24 @@ ll_ddm2 <- function(x, dataBeh2, vd, hd, bd) {
 }
 
 fitSub <- function(s, dataBeh) {
-  fits=matrix(0,1,11)
+  fits=matrix(0,1,8)
   idx = which(dataBeh$subject_id==s)
   dataBeh2 = dataBeh[idx,]
   
-  data1 = ddply(dataBeh2, .(primBF, secBF, bonus), summarize, acc = mean(response_n)) 
+  data1 = ddply(dataBeh2, .(relevant), summarize, acc = mean(response_n)) 
   
-  vd = data1$primBF # performance score for primBF
-  hd = data1$secBF # performance score for secBF
-  bd = data1$bonus # performance score for bonus
+  vd = data1$relevant#relevant DV
   
   # boundaries for parameters
-  lower <- c(-2,-2,-2,0.6,0.01,-1,-1)
-  upper <- c(2,2,2,3,1,1,1)
+  lower <- c(-2,0.6,0.01,-1)
+  upper <- c(2,3,1,1)
   
-  fit_s = DEoptim(ll_ddm2, lower, upper, DEoptim.control(itermax = 200,NP=100), dataBeh2=dataBeh2, vd=vd, hd=hd, bd=bd) 
-  fits[1,1:7] = fit_s$optim$bestmem #fitted parameters
-  fits[1,8] = fit_s$optim$bestval #LL
-  fits[1,9] = 2*fit_s$optim$bestval + length(lower)*log(length(vd)) #BIC
-  fits[1,10] = 2*fit_s$optim$bestval + 2*length(lower) #AIC
-  fits[1,11] = s
+  fit_s = DEoptim(ll_vanilla_ddm2, lower, upper, DEoptim.control(itermax = 200), dataBeh2=dataBeh2, vd=vd) 
+  fits[1,1:length(lower)] = fit_s$optim$bestmem #fitted parameters
+  fits[1,length(lower)+1] = fit_s$optim$bestval #LL
+  fits[1,length(lower)+2] = 2*fit_s$optim$bestval + length(lower)*log(length(vd)) #BIC
+  fits[1,length(lower)+3] = 2*fit_s$optim$bestval + 2*length(lower) #AIC
+  fits[1,length(lower)+4] = s
   
   return(fits)
 }
@@ -139,10 +127,10 @@ fits = mclapply(inputs, fitSub, mc.cores = 1, dataBeh=dataBeh)
 
 #save now in case unlist fails
 fitsF=fits
-write.csv(fitsF, file = "fits_tDDM_self.csv")
+write.csv(fitsF, file = here::here("ddm","fits","fits_vanilla_DDM_self.csv"))
 
-fits = as.data.frame(matrix(unlist(fits),ncol=11,byrow=TRUE))
-names(fits)<-c("d_primBF", "d_secBF", "d_bonus", "thres", "nDT", "timesecBFIn", "bias", "LL", "BIC", "AIC","ppt")
+fits = as.data.frame(matrix(unlist(fits),ncol=8,byrow=TRUE))
+names(fits)<-c("d_rel","thres", "nDT", "bias", "LL", "BIC", "AIC","ppt")
 #will overwrite previous save, but that is intended
 fitsF=fits
-write.csv(fitsF, file = "fits_tDDM_self.csv")
+write.csv(fitsF, file = here::here("ddm","fits","fits_vanilla_DDM_self.csv"))
